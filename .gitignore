@@ -1,0 +1,25 @@
+# 虚拟环境
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+
+# 用户数据（保留 chat_history.json 忽略，但不忽略 .gguf）
+chat_history.json
+
+# 日志、临时文件、编辑器备份
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# 打包文件
+*.tar.gz
+*.zip
