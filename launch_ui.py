@@ -1,93 +1,119 @@
-import threading
-import time
-import os
+import os,threading
 import sys
-import requests
-import tarfile
+import time
 import tempfile
 import shutil
+import tarfile
+import requests
+import json
 
-VERSION = "1.1"
-REMOTE_VERSION_URL = "https://openxc.surge.sh/version.txt"
-UPDATE_URL = "https://openxc.surge.sh/update.tar.gz"
+def check_and_update(current_version):
+    """
+    从 GitHub Releases 检查更新，如有新版本则提示并下载安装，同时保留用户数据。
+    
+    参数:
+        current_version: str, 当前本地版本号（如 "1.2"）
+    """
+    GITHUB_REPO = "zhaoqianrun/open-xiangcao-cli"
+    API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    USER_AGENT = "openxc-updater/1.0"
 
-def check_and_update():
-    """检查更新，如有新版本则提示并更新代码，同时保留用户数据（聊天记录和模型）"""
     try:
-        resp = requests.get(REMOTE_VERSION_URL, timeout=100)
-        if resp.status_code != 200:
-            return
-        remote_version = resp.text.strip()
-        if remote_version == VERSION:
-            return
-        print(f"发现新版本 {remote_version}（当前 {VERSION}）")
-        choice = input("是否更新代码？(y/n): ")
-        if choice.lower() != 'y':
+        # 获取远程最新版本信息
+        headers = {"User-Agent": USER_AGENT}
+        resp = requests.get(API_URL, headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        remote_version = data["tag_name"].lstrip("v")
+        release_body = data.get("body", "")
+
+        if remote_version == current_version:
+            print("已是最新版本。")
             return
 
-        # 备份用户数据
-        backup_dir = tempfile.mkdtemp()
-        user_data_files = ["chat_history.json"]
-        user_data_dirs = ["models"]
+        print(f"发现新版本 {remote_version}（当前 {current_version}）")
+        if release_body:
+            print("\n更新日志:\n" + release_body)
 
-        try:
-            # 备份文件
-            for fname in user_data_files:
-                if os.path.exists(fname):
-                    shutil.copy2(fname, os.path.join(backup_dir, fname))
-            # 备份目录
-            for dname in user_data_dirs:
-                if os.path.exists(dname):
-                    shutil.copytree(dname, os.path.join(backup_dir, dname))
-        except Exception as e:
-            print(f"备份用户数据失败: {e}")
-            # 可以选择继续或退出
-            # 这里我们继续，但风险自负
+        choice = input("是否更新代码？(y/n/skip): ").strip().lower()
+        if choice == 'skip':
+            skip_file = os.path.expanduser("~/.openxc_skip")
+            with open(skip_file, "w") as f:
+                f.write(current_version)
+            print("已跳过此版本，下次启动不再提示。")
+            return
+        if choice != 'y':
+            print("已取消更新。")
+            return
 
-        # 下载更新包
+        # 下载更新包（使用永久链接）
+        download_url = f"https://github.com/{GITHUB_REPO}/releases/download/v{remote_version}/update.tar.gz"
+        print("正在下载更新包...")
         with tempfile.TemporaryDirectory() as tmpdir:
             update_file = os.path.join(tmpdir, "update.tar.gz")
-            print("正在下载更新...")
-            ret = os.system(f"wget -q -O {update_file} {UPDATE_URL}")
-            if ret != 0 or not os.path.exists(update_file):
-                print("下载失败")
+            resp = requests.get(download_url, stream=True, timeout=30)
+            resp.raise_for_status()
+            total = int(resp.headers.get('content-length', 0))
+            with open(update_file, 'wb') as f:
+                downloaded = 0
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total:
+                            percent = int(100 * downloaded / total)
+                            print(f"\r进度: {percent}%", end="")
+            print("\n下载完成。")
+
+            # 备份用户数据
+            backup_dir = tempfile.mkdtemp()
+            user_data_files = ["chat_history.json"]
+            user_data_dirs = ["models"]
+            try:
+                for fname in user_data_files:
+                    if os.path.exists(fname):
+                        shutil.copy2(fname, os.path.join(backup_dir, fname))
+                for dname in user_data_dirs:
+                    if os.path.exists(dname):
+                        shutil.copytree(dname, os.path.join(backup_dir, dname))
+            except Exception as e:
+                print(f"备份用户数据失败: {e}")
                 return
 
-            # 解压更新包（覆盖代码文件）
-            print("正在解压...")
-            with tarfile.open(update_file, "r:gz") as tar:
-                # 这里直接解压全部，因为后面会恢复用户数据
-                tar.extractall(path=".", filter='data')
+            # 解压更新包
+            try:
+                with tarfile.open(update_file, "r:gz") as tar:
+                    tar.extractall(path=".", filter='data')
+                print("代码更新完成。")
+            except Exception as e:
+                print(f"解压失败: {e}")
+                shutil.rmtree(backup_dir, ignore_errors=True)
+                return
 
-        # 恢复用户数据
-        try:
-            for fname in user_data_files:
-                backed = os.path.join(backup_dir, fname)
-                if os.path.exists(backed):
-                    shutil.copy2(backed, fname)
-            for dname in user_data_dirs:
-                backed = os.path.join(backup_dir, dname)
-                if os.path.exists(backed):
-                    # 如果目标目录已存在，先删除再复制（避免残留）
-                    if os.path.exists(dname):
-                        shutil.rmtree(dname)
-                    shutil.copytree(backed, dname)
-        except Exception as e:
-            print(f"恢复用户数据失败: {e}")
+            # 恢复用户数据
+            try:
+                for fname in user_data_files:
+                    backed = os.path.join(backup_dir, fname)
+                    if os.path.exists(backed):
+                        shutil.copy2(backed, fname)
+                for dname in user_data_dirs:
+                    backed = os.path.join(backup_dir, dname)
+                    if os.path.exists(backed):
+                        if os.path.exists(dname):
+                            shutil.rmtree(dname)
+                        shutil.copytree(backed, dname)
+            except Exception as e:
+                print(f"恢复用户数据失败: {e}")
 
-        # 清理备份目录
-        shutil.rmtree(backup_dir, ignore_errors=True)
-
-        print("更新完成！请重启程序。")
-        sys.exit(0)
+            shutil.rmtree(backup_dir, ignore_errors=True)
+            print("更新完成！请重启程序。")
+            sys.exit(0)
 
     except Exception as e:
         print(f"更新检查失败: {e}")
         time.sleep(10)
-
-# 执行更新检查
-check_and_update()
-
+VERSION = "1.2"
+check_and_update(VERSION)
 # 设置 Termux 字体大小
 termux_properties = "/data/data/com.termux/files/home/.termux/termux.properties"
 os.makedirs(os.path.dirname(termux_properties), exist_ok=True)
